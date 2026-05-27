@@ -1,236 +1,258 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime
 
-# =========================
-# ページ設定
-# =========================
 st.set_page_config(
-    page_title="Stock Scoring App",
-    layout="wide"
+    page_title="株スコアリング",
+    page_icon="📈",
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
-# =========================
-# データ取得
-# =========================
-def get_data(ticker, period="2y"):
+# CSS
+st.markdown("""
+<style>
+    .main { padding: 0.5rem; }
+    .block-container { padding: 1rem 0.8rem; max-width: 480px; margin: auto; }
+    h1 { font-size: 1.4rem !important; }
+    h2 { font-size: 1.1rem !important; }
+    h3 { font-size: 1rem !important; }
+    .stSlider > div { padding: 0; }
 
-    df = yf.download(
-        ticker,
-        period=period,
-        auto_adjust=True
+    .score-box {
+        border-radius: 16px;
+        padding: 1.2rem;
+        text-align: center;
+        margin: 1rem 0;
+        color: white;
+        font-weight: bold;
+    }
+    .score-number { font-size: 3rem; line-height: 1; }
+    .score-label { font-size: 1.2rem; margin-top: 0.4rem; }
+    .score-action { font-size: 1.5rem; margin-top: 0.3rem; }
+
+    .cat-header {
+        background: #1e1e2e;
+        border-radius: 10px;
+        padding: 0.5rem 0.8rem;
+        margin: 0.8rem 0 0.3rem 0;
+        font-weight: bold;
+        font-size: 0.95rem;
+    }
+    .metric-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.4rem 0.2rem;
+        border-bottom: 1px solid #2d2d2d;
+        font-size: 0.85rem;
+    }
+    .badge {
+        border-radius: 8px;
+        padding: 2px 10px;
+        font-weight: bold;
+        font-size: 0.8rem;
+    }
+    .badge-on  { background:#1a472a; color:#4ade80; }
+    .badge-off { background:#2d2d2d; color:#888; }
+
+    .history-card {
+        background: #1a1a2e;
+        border-radius: 12px;
+        padding: 0.8rem;
+        margin: 0.5rem 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    div[data-testid="stForm"] { border: none; padding: 0; }
+    .stButton > button {
+        width: 100%;
+        border-radius: 12px;
+        height: 3rem;
+        font-size: 1rem;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── 状態初期化 ───────────────────────────────────────────
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# ─── スコア定義 ───────────────────────────────────────────
+CRITERIA = {
+    "trend": {
+        "label": "📈 トレンド系",
+        "max": 8,
+        "items": [
+            {"key": "above_200ma",  "label": "株価 > 200日MA",                   "points": 3},
+            {"key": "golden_cross", "label": "50日MA > 200日MA（GC状態）",        "points": 2},
+            {"key": "above_50ma",   "label": "株価 > 50日MA",                    "points": 2},
+            {"key": "near_52w_high","label": "52週高値の80%以上",                 "points": 1},
+        ]
+    },
+    "momentum": {
+        "label": "⚡ モメンタム系",
+        "max": 6,
+        "items": [
+            {"key": "rsi_50_70",    "label": "RSI 50〜70（健全な上昇）",          "points": 3},
+            {"key": "rsi_40_50",    "label": "RSI 40〜50（押し目圏）",            "points": 1},
+            {"key": "rsi_under30",  "label": "RSI 30以下（売られすぎ）",          "points": 2},
+            {"key": "macd_positive","label": "MACDヒストグラム プラス圏",         "points": 2},
+            {"key": "macd_cross",   "label": "MACDヒストグラム マイナス→プラス転換","points": 1},
+        ]
+    },
+    "value": {
+        "label": "💡 出来高・バリュー系",
+        "max": 6,
+        "items": [
+            {"key": "volume_surge", "label": "出来高 > 20日平均×1.5（上昇時）",  "points": 2},
+            {"key": "bb_normal",    "label": "BB -1σ〜+1σ 内（過熱なし）",       "points": 1},
+            {"key": "fair_price",   "label": "52週平均乖離 -10%〜+10%",           "points": 1},
+            {"key": "rs_strong",    "label": "S&P500より相対強度が高い（3ヶ月）", "points": 2},
+        ]
+    }
+}
+
+JUDGEMENTS = [
+    (16, 20, "#16a34a", "🔥 強い買い",  "強いシグナル。積極的に買い"),
+    (12, 15, "#22c55e", "✅ 買い",      "買いシグナル。エントリー検討"),
+    ( 8, 11, "#eab308", "⏸️ 静観",      "動かない。様子見"),
+    ( 4,  7, "#f97316", "⚠️ 売り検討",  "一部利確 or 損切り準備"),
+    ( 0,  3, "#ef4444", "❌ 売り",      "撤退。キャッシュに戻す"),
+]
+
+def get_judgement(score):
+    for lo, hi, color, action, note in JUDGEMENTS:
+        if lo <= score <= hi:
+            return color, action, note
+    return "#888", "—", "—"
+
+# ─── UI ─────────────────────────────────────────────────
+st.markdown("## 📊 株スコアリング")
+st.caption("長期・中リスク・米国株向け定量判断システム")
+
+ticker = st.text_input("銘柄ティッカー（任意）", placeholder="例: AAPL, NVDA, TSLA").upper()
+
+tab1, tab2 = st.tabs(["📝 採点", "📜 履歴"])
+
+# ══════════════════════════════════
+# TAB 1: 採点
+# ══════════════════════════════════
+with tab1:
+    checked = {}
+    total = 0
+
+    for cat_key, cat in CRITERIA.items():
+        st.markdown(f'<div class="cat-header">{cat["label"]}　<span style="color:#888;font-size:0.8rem;">最大{cat["max"]}点</span></div>', unsafe_allow_html=True)
+        for item in cat["items"]:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                val = st.checkbox(f'{item["label"]}　+{item["points"]}点', key=item["key"])
+            checked[item["key"]] = val
+            if val:
+                total += item["points"]
+
+    # スコア表示
+    color, action, note = get_judgement(total)
+    st.markdown(f"""
+    <div class="score-box" style="background:{color};">
+        <div class="score-number">{total}<span style="font-size:1.2rem;">/20</span></div>
+        <div class="score-action">{action}</div>
+        <div class="score-label" style="opacity:0.9;">{note}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ゲージ
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=total,
+        gauge={
+            "axis": {"range": [0, 20], "tickwidth": 1, "tickcolor": "white"},
+            "bar": {"color": color},
+            "bgcolor": "#1e1e2e",
+            "steps": [
+                {"range": [0,  3], "color": "#3d0000"},
+                {"range": [3,  7], "color": "#4a1500"},
+                {"range": [7, 11], "color": "#3d3000"},
+                {"range": [11,15], "color": "#003d10"},
+                {"range": [15,20], "color": "#004d15"},
+            ],
+            "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.75, "value": total}
+        },
+        number={"font": {"color": "white", "size": 48}},
+        domain={"x": [0, 1], "y": [0, 1]}
+    ))
+    fig.update_layout(
+        height=200, margin=dict(t=20, b=0, l=20, r=20),
+        paper_bgcolor="#0e0e1a", font_color="white"
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # MultiIndex対策
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    # 判定表
+    with st.expander("📋 判定基準を見る"):
+        for lo, hi, c, act, note2 in JUDGEMENTS:
+            st.markdown(f'<div style="padding:4px 0;font-size:0.85rem;"><span style="color:{c};font-weight:bold;">{act}</span>　{lo}〜{hi}点　<span style="color:#888;">{note2}</span></div>', unsafe_allow_html=True)
 
-    # 必要列だけ残す
-    df = df[["Open", "High", "Low", "Close", "Volume"]]
+    # 保存ボタン
+    if st.button("💾 このスコアを保存", type="primary"):
+        entry = {
+            "date": datetime.now().strftime("%m/%d %H:%M"),
+            "ticker": ticker if ticker else "—",
+            "score": total,
+            "action": action,
+            "color": color,
+            "checks": {k: v for k, v in checked.items() if v}
+        }
+        st.session_state.history.insert(0, entry)
+        st.success(f"保存しました！ {ticker or ''} {total}点 {action}")
 
-    df = df.dropna()
-
-    return df
-
-
-# =========================
-# 指標計算
-# =========================
-def add_indicators(df):
-
-    df = df.copy()
-
-    # 移動平均
-    df["MA50"] = df["Close"].rolling(50).mean()
-    df["MA200"] = df["Close"].rolling(200).mean()
-
-    # 52週高値
-    df["52w_high"] = df["Close"].rolling(252).max()
-    df["high_ratio"] = df["Close"] / df["52w_high"]
-
-    # RSI
-    delta = df["Close"].diff()
-
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / avg_loss
-
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-
-    df["MACD"] = ema12 - ema26
-    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
-
-    # 出来高平均
-    df["vol_ma20"] = df["Volume"].rolling(20).mean()
-
-    return df
-
-
-# =========================
-# スコアリング
-# =========================
-def score_latest(df):
-
-    row = df.iloc[-1]
-
-    score = 0
-    detail = {}
-
-    # =====================
-    # トレンド
-    # =====================
-
-    if row["Close"] > row["MA200"]:
-        score += 3
-        detail["株価 > MA200"] = 3
-
-    if row["MA50"] > row["MA200"]:
-        score += 2
-        detail["MA50 > MA200"] = 2
-
-    if row["Close"] > row["MA50"]:
-        score += 2
-        detail["株価 > MA50"] = 2
-
-    if row["high_ratio"] >= 0.8:
-        score += 1
-        detail["52週高値圏"] = 1
-
-    # =====================
-    # モメンタム
-    # =====================
-
-    rsi = row["RSI"]
-
-    if 50 <= rsi <= 70:
-        score += 3
-        detail["RSI良好"] = 3
-
-    elif 40 <= rsi < 50:
-        score += 1
-        detail["RSI中立"] = 1
-
-    elif rsi <= 30:
-        score += 2
-        detail["RSI売られすぎ"] = 2
-
-    if row["MACD_hist"] > 0:
-        score += 2
-        detail["MACDプラス"] = 2
-
-    # =====================
-    # 出来高
-    # =====================
-
-    if row["Volume"] > row["vol_ma20"] * 1.5:
-        score += 2
-        detail["出来高急増"] = 2
-
-    # =====================
-    # 判定
-    # =====================
-
-    if score >= 16:
-        label = "🟢 強い買い"
-
-    elif score >= 12:
-        label = "🟢 買い"
-
-    elif score >= 10:
-        label = "🟡 買い増し検討"
-
-    elif score >= 7:
-        label = "⏸ 静観"
-
-    elif score >= 4:
-        label = "🔴 売り検討"
-
+# ══════════════════════════════════
+# TAB 2: 履歴
+# ══════════════════════════════════
+with tab2:
+    if not st.session_state.history:
+        st.info("まだ履歴がありません。\n採点タブでスコアを保存してください。")
     else:
-        label = "❌ 売り"
+        # スコア推移チャート
+        if len(st.session_state.history) >= 2:
+            df = pd.DataFrame(st.session_state.history[::-1])
+            fig2 = px.line(
+                df, x="date", y="score",
+                markers=True, color_discrete_sequence=["#22c55e"],
+                labels={"date": "", "score": "スコア"},
+                title="スコア推移"
+            )
+            fig2.add_hrect(y0=16, y1=20, fillcolor="#16a34a", opacity=0.15, line_width=0)
+            fig2.add_hrect(y0=12, y1=16, fillcolor="#22c55e", opacity=0.1,  line_width=0)
+            fig2.add_hrect(y0=8,  y1=11, fillcolor="#eab308", opacity=0.1,  line_width=0)
+            fig2.add_hrect(y0=4,  y1=7,  fillcolor="#f97316", opacity=0.1,  line_width=0)
+            fig2.add_hrect(y0=0,  y1=3,  fillcolor="#ef4444", opacity=0.1,  line_width=0)
+            fig2.update_layout(
+                height=220, paper_bgcolor="#0e0e1a", plot_bgcolor="#0e0e1a",
+                font_color="white", margin=dict(t=40, b=20, l=10, r=10),
+                yaxis=dict(range=[0, 20], gridcolor="#2d2d2d"),
+                xaxis=dict(gridcolor="#2d2d2d")
+            )
+            st.plotly_chart(fig2, use_container_width=True)
 
-    return score, label, detail
+        # 履歴カード
+        for i, entry in enumerate(st.session_state.history):
+            col1, col2, col3 = st.columns([3, 2, 1])
+            with col1:
+                st.markdown(f"**{entry['ticker']}**　{entry['date']}")
+                st.caption(entry['action'])
+            with col2:
+                st.markdown(f'<span style="color:{entry["color"]};font-size:1.5rem;font-weight:bold;">{entry["score"]}点</span>', unsafe_allow_html=True)
+            with col3:
+                if st.button("🗑", key=f"del_{i}"):
+                    st.session_state.history.pop(i)
+                    st.rerun()
+            st.divider()
 
-
-# =========================
-# UI
-# =========================
-
-st.title("📊 定量スコア型 株分析アプリ")
-
-st.write("長期投資向けテクニカル分析スコアリング")
-
-ticker = st.text_input(
-    "ティッカー（例：AAPL, MSFT, NVDA）",
-    "AAPL"
-)
-
-period = st.selectbox(
-    "期間",
-    ["1y", "2y", "5y"],
-    index=1
-)
-
-# =========================
-# 分析実行
-# =========================
-
-if st.button("分析開始"):
-
-    try:
-
-        # データ取得
-        with st.spinner("データ取得中..."):
-
-            df = get_data(ticker, period)
-
-        # 指標計算
-        with st.spinner("指標計算中..."):
-
-            df = add_indicators(df)
-
-        # スコア計算
-        with st.spinner("スコア計算中..."):
-
-            score, label, detail = score_latest(df)
-
-        # =====================
-        # 表示
-        # =====================
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            st.subheader(f"総合スコア：{score} / 20")
-
-            st.subheader(label)
-
-            st.write("### スコア内訳")
-
-            st.json(detail)
-
-        with col2:
-
-            st.write("### 株価チャート")
-
-            st.line_chart(df["Close"])
-
-        st.write("### 最新データ")
-
-        st.dataframe(df.tail(10))
-
-    except Exception as e:
-
-        st.error("エラーが発生しました")
-
-        st.exception(e)
+        if st.button("🗑️ 履歴を全削除"):
+            st.session_state.history = []
+            st.rerun()
